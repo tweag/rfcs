@@ -530,7 +530,7 @@ in dependencies (if they exist) are ignored.
 
 When you build a local repository (e.g. `nix build /path/to/repo`),
 Nix automatically creates a `flake.lock` file if it doesn't already
-exists. It will also update the lock file if inputs are added or
+exist. It will also update the lock file if inputs are added or
 removed. You can pass `--recreate-lock-file` to force Nix to recreate
 the lock file from scratch (and thus check for the latest version of
 each input).
