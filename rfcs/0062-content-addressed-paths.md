@@ -144,7 +144,9 @@ The process for building a content-adressed derivation `drv` is the following:
   computing the hash and rewrite them when moving the path to handle paths with
   self-references, but this isn't strictly required for a first iteration
 
-## Example
+# Examples and Interactions
+
+[examples-and-interactions]: #examples-and-interactions
 
 In this example, we have the following Nix expression:
 
