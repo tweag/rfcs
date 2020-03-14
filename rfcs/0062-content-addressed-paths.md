@@ -107,20 +107,20 @@ We define a **resolved derivation** as a derivation whose only references are ei
 - References to the outputs of other (non content-addresed) resolved derivations
 - Existing store paths
 
-For a derivation `drv` whose input derivations have all been realised, we define its **associated resolved derivation** `resolved(drv)` as `drv` in which we replace every input derivation `inDrv` of `drv` by `pathOf(inDrv)` (and update the output hash accordingly).
+For a derivation `drv` whose input derivations have all been realised, we define its **associated resolved derivation** `resolve(drv)` as `drv` in which we replace every input derivation `inDrv` of `drv` by `pathOf(inDrv)` (and update the output hash accordingly).
 
-> This doesn't have the property that for a derivation that doesn't depend on any CA derivation `resolved(drv) == drv`. I think that this is a rather big issue so we'll have to find a way to get this property back (but feel free to correct me if you think that it isn't a big deal)
+> This doesn't have the property that for a derivation that doesn't depend on any CA derivation `resolve(drv) == drv`. I think that this is a rather big issue so we'll have to find a way to get this property back (but feel free to correct me if you think that it isn't a big deal)
 
-`resolved` is (intentionally) not injective: If `drv` and `drv'` only differ because one depends on `dep` and the other on `dep'`, but `dep` and `dep'` are content-addressed and have the same output hash, then `resolved(drv)` and `resolved(drv')` will be equal.
+`resolved` is (intentionally) not injective: If `drv` and `drv'` only differ because one depends on `dep` and the other on `dep'`, but `dep` and `dep'` are content-addressed and have the same output hash, then `resolve(drv)` and `resolve(drv')` will be equal.
 
 #### Build process
 
 When asked to build a derivation `drv`, we instead:
 
-1. Compute `resolved(drv)`
-2. Substitute and build `resolved(drv)` like a normal derivation.
-   Possibly this is a no-op because it may be that `resolved(drv)` has already been built.
-3. Add a new mapping `pathOf(drv!${output}) == ${output}(resolved(drv))` for each output `output` of `drv`
+1. Compute `resolve(drv)`
+2. Substitute and build `resolve(drv)` like a normal derivation.
+   Possibly this is a no-op because it may be that `resolve(drv)` has already been built.
+3. Add a new mapping `pathOf(drv!${output}) == ${output}(resolve(drv))` for each output `output` of `drv`
 
 ### Building a ca derivation
 
@@ -176,24 +176,24 @@ What will happen is the following
 1. We instantiate the Nix expression, this gives us three drv files:
    `contentAddressed.drv`, `dependent.drv` and `transitivelyDependent.drv`
 2. We build `contentAddressed.drv`.
-   - We first compute `resolved(contentAddressed.drv)`.
-   - We realise `resolved(contentAddressed.drv)`. This gives us an output path
-     `out(resolved(contentAddressed.drv))`
-   - We move `out(resolved(contentAddressed.drv))` to its content-adressed path
+   - We first compute `resolve(contentAddressed.drv)`.
+   - We realise `resolve(contentAddressed.drv)`. This gives us an output path
+     `out(resolve(contentAddressed.drv))`
+   - We move `out(resolve(contentAddressed.drv))` to its content-adressed path
      `ca(contentAddressed.drv)` which derives from
-     `sha256(out(resolved(contentAddressed.drv)))`
+     `sha256(out(resolve(contentAddressed.drv)))`
    - We register in the db that `pathOf(contentAddressed.drv!out) == ca(contentAddressed.drv)`
 3. We build `dependent.drv`
-   - We first compute `resolved(dependent.drv)`.
+   - We first compute `resolve(dependent.drv)`.
      This gives us a new derivation identical to `dependent.drv`, except that `contentAddressed.drv!out` is replaced by `pathOf(contentAddressed.drv!out) == ca(contentAddressed.drv)`
-   - We realise `resolved(dependent.drv)`. This gives us an output path
-     `out(resolved(dependent.drv))`
-   - We register in the db that `pathOf(dependent.drv!out) == out(resolved(dependent.drv))` We build `transitivelyDependent.drv`
+   - We realise `resolve(dependent.drv)`. This gives us an output path
+     `out(resolve(dependent.drv))`
+   - We register in the db that `pathOf(dependent.drv!out) == out(resolve(dependent.drv))` We build `transitivelyDependent.drv`
 4. We build `transitivelyDependent.drv`
-   - We first compute `resolved(transitivelyDependent.drv)`
-     This gives us a new derivation identical to `transitivelyDependent.drv`, except that `dependent.drv!out` is replaced by `pathOf(dependent.drv!out) == out(resolved(dependent.drv))`
-   - We realise `resolved(transitivelyDependent.drv)`. This gives us an output path `out(resolved(transitivelyDependent.drv))`
-   - We register in the db that `pathOf(transitivelyDependent.drv!out) == out(resolved(transitivelyDependent.drv))`
+   - We first compute `resolve(transitivelyDependent.drv)`
+     This gives us a new derivation identical to `transitivelyDependent.drv`, except that `dependent.drv!out` is replaced by `pathOf(dependent.drv!out) == out(resolve(dependent.drv))`
+   - We realise `resolve(transitivelyDependent.drv)`. This gives us an output path `out(resolve(transitivelyDependent.drv))`
+   - We register in the db that `pathOf(transitivelyDependent.drv!out) == out(resolve(transitivelyDependent.drv))`
 
 Now suppose that we replace `contentAddressed` by `contentAddressed'`, which evaluates to a new derivation `contentAddressed'.drv` such that the output of `contentAddressed'.drv` is the same as the output of `contentAddressed.drv` (say we change a comment in a source file of `contentAddressed`).
 We try to rebuild the new `transitivelyDependent`. What happens is the following:
@@ -201,17 +201,17 @@ We try to rebuild the new `transitivelyDependent`. What happens is the following
 1. We instantiate the Nix expression, this gives us three new drv files:
    `contentAddressed'.drv`, `dependent'.drv` and `transitivelyDependent'.drv`
 2. We build `contentAddressed'.drv`.
-   - We first compute `resolved(contentAddressed'.drv)`
-   - We realise `resolved(contentAddressed'.drv)`. This gives us an output path `out(resolved(contentAddressed'.drv))`
+   - We first compute `resolve(contentAddressed'.drv)`
+   - We realise `resolve(contentAddressed'.drv)`. This gives us an output path `out(resolve(contentAddressed'.drv))`
    - We compute `ca(contentAddressed'.drv)` and notice that the path already exists (since it's the same as the one we built previously), so we discard the result.
    - We register in the db that `pathOf(contentAddressed.drv'!out) == ca(contentAddressed'.drv)` ( also equals to `ca(contentAddressed.drv)`)
 3. We build `dependent'.drv`
-   - We first compute `resolved(dependent'.drv)`.
+   - We first compute `resolve(dependent'.drv)`.
      This gives us a new derivation identical to `dependent'.drv`, except that `contentAddressed'.drv!out` is replaced by `pathOf(contentAddressed'.drv!out) == ca(contentAddressed'.drv)`
-   - We notice that `resolved(dependent'.drv) == resolved(dependent.drv)` (since `ca(contentAddressed'.drv) == ca(contentAddressed.drv)`), so we just return the already existing path
+   - We notice that `resolve(dependent'.drv) == resolve(dependent.drv)` (since `ca(contentAddressed'.drv) == ca(contentAddressed.drv)`), so we just return the already existing path
 4. We build `transitivelyDependent'.drv`
-   - We first compute `resolved(transitivelyDependent'.drv)`
-   - Here again, we notice that `resolved(transitivelyDependent'.drv)` is the same as `resolved(transitivelyDependent.drv)`, so we don't build anything
+   - We first compute `resolve(transitivelyDependent'.drv)`
+   - Here again, we notice that `resolve(transitivelyDependent'.drv)` is the same as `resolve(transitivelyDependent.drv)`, so we don't build anything
 
 # Drawbacks
 
