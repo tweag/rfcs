@@ -59,34 +59,97 @@ cutoffs.
 
 The gist of the design is that:
 
-- Some derivations can be marked as content-adressed (ca), in which case each
-  one of their output will be moved to a path `ca` determined only by its
-  content after the build
-- We introduce the notion of a `resolved derivation` which is a derivation that
-  doesn't refer to any other derivation but only to concrete store paths.
-  To prevent ambiguities, we might speak of a `symbolic derivation` to
-  designate a derivation that's not necessarily resolved.
-  We also define a `resolving` function that given a symbolic derivation
-  returns a new resolved derivation with the same semantics.
-- When asked to build a derivation, Nix will first resolve it, build the
-  resolved derivation and link back the symbolic one to the out path of the
-  resolved one.
+- Derivations can be marked as content-adressed (ca), in which case each
+  of their outputs will be moved to a content-addressed `ca` store path.
 
-## Nix-build process
+- This definitions includes today's fixed-output (ca) derivations.
+  In addition, we will have new "floating-output"" ca derivations.
 
-### Output mappings
+- We extended a little-known existing notion of normalizing fixed-output ca derivations to
+  account `ca` derivations in general, and give it a name: "resolving" a derivation.
 
-For each output `output` of a derivation `drv`, we define
+## Content-addressed derivations derivation
 
-- its output id **DrvOutputId(drv, output)** as the tuple `(hash(drv), output, truster)`, where `truster` is a reserved field for future use and currently always set to `"world"`.
+### Derivation model, and file format
+
+- A **ca derivation** is one with a hash algorithm for every output.
+
+- A fixed-output ca derivation has a single output, and a hash algorithm and (fixed) hash for that output.
+  This is unchanged from today.
+
+- A floating-output ca derivation has one or more outputs, each of which has the same hash algorithm but none of which have (fixed) hashes.
+
+### Nix language
+
+A **ca derivation** is a derivation with the `__contentAddressed` argument set
+to `true` and the `outputHashAlgo` set to a value that is a valid hash name
+recognized by Nix (see the description for `outputHashAlgo` at
+<https://nixos.org/nix/manual/#sec-advanced-attributes> for the current allowed
+values**.
+It can specify its outputs normally with `outputs`, otherwise a single output, `out`, is assumed.
+
+## Derivation resolution
+
+Derivation resolution today replaces fixed-output ca derivations with their single content-addressed store output.
+\[For reference, it is implemented by `hashDerivationModulo`.]
+It does this by resolving input derivations and rewriting those to account for transitive dependencies with fixed-output ca derivations.
+
+A **resolved** derivation is one which only references:
+
+ - outputs of other (non content-addresed) resolved derivations
+ - Existing store paths
+
+Derivation resolution thus produces resolved derivations, and is idempotent, mapping resolved derivations to themselves.
+
+resolution is (intentionally) not injective: If `drv` and `drv'` only differ because one depends on `dep` and the other on `dep'`, but `dep` and `dep'` are content-addressed and have the same output hash, then `resolve(drv)` and `resolve(drv')` will be equal.
+This already shows up today when we change a `fetch*` function's definition and *don't* have a mass rebuild.
+
+We generalize it to replace all ca derivations with the hashes of their in-use outputs, not just fixed-output ca derivations.
+
+Derivation resolution is conceptually mutually recursive.
+One function maps a pair of a derivation reference (currently a path, but in no way implying the derivation is serialized at that path) and an output to a content address (dependent pair of an algo and a hash in the form of that algo).
+The other maps derivations to derivations, substitutes store path for input derivation.
+The mutual recursion is important because if we want ultimately want a path/reference we will start with the first, but if we ultimately want a derivation (e.g. to write to a `.drv` file or build), we will start with the second.
+The current implementation[^current-implementation] somewhat obscures this, but this proposal doesn't change when we want paths vs when we want derivations.[^mrec-uses]
+
+Derivations written to disk are always resolved, but not including the root.
+This is because we are writing derivations, not hashes/paths, to derivation.
+If we replace a derivation with its single output path, there is no derivation!
+Derivations being built are also resolved, not including the root.
+This is because we need a derivation to do a build.
+Hashes or paths to not say how to compute what they refer to!
+
+### Remembering floating output hashes
+
+Normalizing fixed outputs is easier than floating outputs, because the derivation contains the hash with which to create the ca store path.
+By contrast, the information is not present for floating outputs, and must be gotten out of band.
+
+For each output `output` of a floating-output ca derivation `drv`, we define
+
+- its `outputId` **DrvOutputId(drv, output)** as the tuple `(hash(drv), output, truster)`, where `truster` is a reserved field for future use and currently always set to `"world"`.
+  \[See trust model in the [future work section](#future-work)].
   This id uniquely identifies the output.
   We textually represent this as `hash(drv)!output[@truster]`.
+
 - its concrete path **PathOf(outputId)** as the path on which the output will be stored on disk.
 
 > Unresolved: should we already include the `truster` field in `DrvOutputId`
 > even if it's not used atm? What would be the cost of adding it later?
 
-In a dependency-addressed-only world, the concrete path for a derivation output was a pure function of this output's id that could be computed at eval-time. However this won't be the case anymore once we allow content-addressed derivations, so we now need to store the results the `PathOf` function in the Nix database as a new table:
+At a minimum, we need to store output paths for resolved floating-output ca derivations, which, along with the fixed-output ca derivations' output hashes, generates the resolving function.
+We can do that with a table in the SQLite database:
+
+```sql
+create table if not exists PathOf (
+    drv integer not null,
+    output text not null,
+    truster integer not null,
+    hash text not null,
+)
+```
+
+However, we may also wish to memoize the function over other derivations which merely refer to ca derivations.
+In this case, we can use this table:
 
 ```sql
 create table if not exists PathOf (
@@ -97,46 +160,85 @@ create table if not exists PathOf (
 )
 ```
 
+Note that we must replace the hash column with a path column (which is an integer because its a surrogate foreign key).
+This is because while non-ca derivations which refer to ca-derivations do use a "modified" store path from the resolved derivation, it not a content-address store path as the resolved root derivation is still a regular legacy derivation.
+
+## Nix-build process
+
+Just like today, we only build resolved derivations.
+This is so we take advantage of as much normalization as possible to avoid rebuilds.
+When there were only fixed-output ca derivations, this was easy, as we always have the information to resolve any derivation.
+But when there are also floating-output ca derivations, we don't necessary have the information we need in the table.
+Thus we need to *interleave* building and resolving, until there is no work left.
+
+The algorithm is presented in the following mutually recursive steps.
+
 ### Building a normal derivation
 
-#### Resolved derivations
+Same today, except in the case of the larger memo table (second option) there is one extra step:
+We will add a row if the normal derivation refers to floating-output ca derivations.
 
-We define a **resolved derivation** as a derivation whose only references are either:
+1. Compute `resolve(drv)`
 
-- Self references
-- References to the outputs of other (non content-addresed) resolved derivations
-- Existing store paths
+2. If already built, return, else build the derivation (and continue to next step)
 
-For a derivation `drv` whose input derivations have all been realised, we define its **associated resolved derivation** `resolved(drv)` as `drv` in which we replace every input derivation `inDrv` of `drv` by `pathOf(inDrv)` (and update the output hash accordingly).
+3. *Assuming the memo table:* Add a new mapping `pathOf(drv!${output}) == ${output}(resolve(drv))` for each output `output` of `drv`.
 
-> This doesn't have the property that for a derivation that doesn't depend on any CA derivation `resolved(drv) == drv`. I think that this is a rather big issue so we'll have to find a way to get this property back (but feel free to correct me if you think that it isn't a big deal)
+### Resolution
 
-`resolved` is (intentionally) not injective: If `drv` and `drv'` only differ because one depends on `dep` and the other on `dep'`, but `dep` and `dep'` are content-addressed and have the same output hash, then `resolved(drv)` and `resolved(drv')` will be equal.
+Keep a set of "stuck" floating ca-derivations; i.e. those without a table entry.
 
-#### Build process
+1. Resolve as much as possible.
 
-When asked to build a derivation `drv`, we instead:
+   - When encountering a floating ca derivation with no table entry, just move on but add the stuck derivation to the set.
+     With the first table option, we can only look up resolved derivations, so we work bottom up (like call by value).
+     With the second table option, we may have an memo entry for an intermediate (non-leaf) derivation, so we work up until we find an entry or reach a leaf node, and then work down (like call by need).
 
-1. Compute `resolved(drv)`
-2. Substitute and build `resolved(drv)` like a normal derivation.
-   Possibly this is a no-op because it may be that `resolved(drv)` has already been built.
-3. Add a new mapping `pathOf(drv!${output}) == ${output}(resolved(drv))` for each output `output` of `drv`
+   - If never stuck, return with resolved derivation, we have finally resolved the derivation.
+
+2. Build all stuck derivations
+
+3. Repeat making more progress by using the new table entries from the newly-unstuck derivations.
 
 ### Building a ca derivation
 
-A **ca derivation** is a derivation with the `__contentAddressed` argument set
-to `true` and the `outputHashAlgo` set to a value that is a valid hash name
-recognized by Nix (see the description for `outputHashAlgo` at
-<https://nixos.org/nix/manual/#sec-advanced-attributes> for the current allowed
-values).
+These steps cover both fixed- and floating- output CA derivations, but the algorithm for fixed-output ca
 
-The process for building a content-adressed derivation `drv` is the following:
+1. Compute `resolve(drv)`
 
-- We build it like a normal derivation (see above).
-  For each output `$outputId` of the derivation, this gives us a (temporary) output path `$out`.
-  - We compute a cryptographic hash `$chash` of `$out`[^modulo-hashing]
-  - We move `$out` to `/nix/store/$chash-$name`
-  - We store the mapping `PathOf($outputId) == "/nix/store/$chash-$name"`
+2. If already built, return, else build the derivation using temporary location for each  (and continue to next step)
+
+3. Move each output to the content-addressed store path corresponding to its hash.
+   For each output `$outputId` of the derivation, this gives us a (temporary) output path `$out`.
+    - We compute a cryptographic hash `$chash` of `$out`[^modulo-hashing]
+    - We move `$out` to `/nix/store/$chash-$name`
+    - We store the mapping `PathOf($outputId) == "/nix/store/$chash-$name"`
+
+4. Depends on whether outputs are fixed or floating:
+
+    - *If fixed-output:* Check if the output matches the fixed hash in the derivation, if so, we move to the next stop, if not the build fails but the moved output is kept in place.
+
+    - *If floating output:* Add a new mapping to the table for each output.
+
+       - *If small generating table:* `hashOf(drv!${output}) == ${output}(resolve(drv))` for each output `output` of `drv`.
+
+       - *If large memo table:* `pathOf(drv!${output}) == ${output}(resolve(drv))` for each output `output` of `drv`.
+
+[^current-implementation]:
+
+  The function `hashDerivationModulo`
+
+[^mrec-uses]:
+
+  Here are some examples of when each is used:
+
+   - Derivations written to disk are always resolved, but not including the root.
+     This is because we are writing derivations, not hashes/paths, to derivation.
+     If we replace a derivation with its single output path, there is no derivation!
+
+   - Derivations being built are also resolved, not including the root.
+     This is because we need a derivation to do a build.
+     Hashes or paths to not say how to compute what they refer to!
 
 [^modulo-hashing]:
 
@@ -144,7 +246,13 @@ The process for building a content-adressed derivation `drv` is the following:
   computing the hash and rewrite them when moving the path to handle paths with
   self-references, but this isn't strictly required for a first iteration
 
-## Example
+# Examples and Interactions
+
+[examples-and-interactions]: #examples-and-interactions
+
+First to note is that this "retconning" of fixed-output derivations is crucial to keep the model of how Nix works concise.
+
+## Full example
 
 In this example, we have the following Nix expression:
 
@@ -174,24 +282,24 @@ What will happen is the following
 1. We instantiate the Nix expression, this gives us three drv files:
    `contentAddressed.drv`, `dependent.drv` and `transitivelyDependent.drv`
 2. We build `contentAddressed.drv`.
-   - We first compute `resolved(contentAddressed.drv)`.
-   - We realise `resolved(contentAddressed.drv)`. This gives us an output path
-     `out(resolved(contentAddressed.drv))`
-   - We move `out(resolved(contentAddressed.drv))` to its content-adressed path
+   - We first compute `resolve(contentAddressed.drv)`.
+   - We realise `resolve(contentAddressed.drv)`. This gives us an output path
+     `out(resolve(contentAddressed.drv))`
+   - We move `out(resolve(contentAddressed.drv))` to its content-adressed path
      `ca(contentAddressed.drv)` which derives from
-     `sha256(out(resolved(contentAddressed.drv)))`
+     `sha256(out(resolve(contentAddressed.drv)))`
    - We register in the db that `pathOf(contentAddressed.drv!out) == ca(contentAddressed.drv)`
 3. We build `dependent.drv`
-   - We first compute `resolved(dependent.drv)`.
+   - We first compute `resolve(dependent.drv)`.
      This gives us a new derivation identical to `dependent.drv`, except that `contentAddressed.drv!out` is replaced by `pathOf(contentAddressed.drv!out) == ca(contentAddressed.drv)`
-   - We realise `resolved(dependent.drv)`. This gives us an output path
-     `out(resolved(dependent.drv))`
-   - We register in the db that `pathOf(dependent.drv!out) == out(resolved(dependent.drv))` We build `transitivelyDependent.drv`
+   - We realise `resolve(dependent.drv)`. This gives us an output path
+     `out(resolve(dependent.drv))`
+   - We register in the db that `pathOf(dependent.drv!out) == out(resolve(dependent.drv))` We build `transitivelyDependent.drv`
 4. We build `transitivelyDependent.drv`
-   - We first compute `resolved(transitivelyDependent.drv)`
-     This gives us a new derivation identical to `transitivelyDependent.drv`, except that `dependent.drv!out` is replaced by `pathOf(dependent.drv!out) == out(resolved(dependent.drv))`
-   - We realise `resolved(transitivelyDependent.drv)`. This gives us an output path `out(resolved(transitivelyDependent.drv))`
-   - We register in the db that `pathOf(transitivelyDependent.drv!out) == out(resolved(transitivelyDependent.drv))`
+   - We first compute `resolve(transitivelyDependent.drv)`
+     This gives us a new derivation identical to `transitivelyDependent.drv`, except that `dependent.drv!out` is replaced by `pathOf(dependent.drv!out) == out(resolve(dependent.drv))`
+   - We realise `resolve(transitivelyDependent.drv)`. This gives us an output path `out(resolve(transitivelyDependent.drv))`
+   - We register in the db that `pathOf(transitivelyDependent.drv!out) == out(resolve(transitivelyDependent.drv))`
 
 Now suppose that we replace `contentAddressed` by `contentAddressed'`, which evaluates to a new derivation `contentAddressed'.drv` such that the output of `contentAddressed'.drv` is the same as the output of `contentAddressed.drv` (say we change a comment in a source file of `contentAddressed`).
 We try to rebuild the new `transitivelyDependent`. What happens is the following:
@@ -199,17 +307,17 @@ We try to rebuild the new `transitivelyDependent`. What happens is the following
 1. We instantiate the Nix expression, this gives us three new drv files:
    `contentAddressed'.drv`, `dependent'.drv` and `transitivelyDependent'.drv`
 2. We build `contentAddressed'.drv`.
-   - We first compute `resolved(contentAddressed'.drv)`
-   - We realise `resolved(contentAddressed'.drv)`. This gives us an output path `out(resolved(contentAddressed'.drv))`
+   - We first compute `resolve(contentAddressed'.drv)`
+   - We realise `resolve(contentAddressed'.drv)`. This gives us an output path `out(resolve(contentAddressed'.drv))`
    - We compute `ca(contentAddressed'.drv)` and notice that the path already exists (since it's the same as the one we built previously), so we discard the result.
    - We register in the db that `pathOf(contentAddressed.drv'!out) == ca(contentAddressed'.drv)` ( also equals to `ca(contentAddressed.drv)`)
 3. We build `dependent'.drv`
-   - We first compute `resolved(dependent'.drv)`.
+   - We first compute `resolve(dependent'.drv)`.
      This gives us a new derivation identical to `dependent'.drv`, except that `contentAddressed'.drv!out` is replaced by `pathOf(contentAddressed'.drv!out) == ca(contentAddressed'.drv)`
-   - We notice that `resolved(dependent'.drv) == resolved(dependent.drv)` (since `ca(contentAddressed'.drv) == ca(contentAddressed.drv)`), so we just return the already existing path
+   - We notice that `resolve(dependent'.drv) == resolve(dependent.drv)` (since `ca(contentAddressed'.drv) == ca(contentAddressed.drv)`), so we just return the already existing path
 4. We build `transitivelyDependent'.drv`
-   - We first compute `resolved(transitivelyDependent'.drv)`
-   - Here again, we notice that `resolved(transitivelyDependent'.drv)` is the same as `resolved(transitivelyDependent.drv)`, so we don't build anything
+   - We first compute `resolve(transitivelyDependent'.drv)`
+   - Here again, we notice that `resolve(transitivelyDependent'.drv)` is the same as `resolve(transitivelyDependent.drv)`, so we don't build anything
 
 # Drawbacks
 
