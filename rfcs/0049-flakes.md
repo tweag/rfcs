@@ -246,7 +246,7 @@ useful to minimize flake dependencies. For example, the following sets
 the `nixpkgs` input of the top-level flake to be equal to the
 `nixpkgs` input of the `dwarffs` input of the top-level flake:
 
-    inputs.nixops.follows = "dwarffs/nixpkgs";
+    inputs.nixpkgs.follows = "dwarffs/nixpkgs";
 
 The value of the `follows` attribute is a `/`-separated sequence of
 input names denoting the path of inputs to be followed from the root
